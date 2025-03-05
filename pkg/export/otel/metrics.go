@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/url"
 	"os"
 	"slices"
@@ -45,6 +46,7 @@ const (
 	SpanMetricsCalls   = "traces_spanmetrics_calls_total"
 	SpanMetricsSizes   = "traces_spanmetrics_size_total"
 	TracesTargetInfo   = "traces_target_info"
+	TracesHostInfo     = "traces_host_info"
 	ServiceGraphClient = "traces_service_graph_request_client"
 	ServiceGraphServer = "traces_service_graph_request_server"
 	ServiceGraphFailed = "traces_service_graph_request_failed_total"
@@ -64,6 +66,10 @@ const (
 	FeatureProcess          = "application_process"
 	FeatureEBPF             = "ebpf"
 )
+
+// GrafanaHostIDKey is the same attribute Key as HostIDKey, but used for
+// traces_target_info
+const GrafanaHostIDKey = attribute.Key("grafana.host.id")
 
 type MetricsConfig struct {
 	Interval time.Duration `yaml:"interval" env:"BEYLA_METRICS_INTERVAL"`
@@ -137,6 +143,10 @@ func (m *MetricsConfig) GuessProtocol() Protocol {
 	// Otherwise we return default protocol according to the latest specification:
 	// https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/protocol/exporter.md?plain=1#L53
 	return ProtocolHTTPProtobuf
+}
+
+func (m *MetricsConfig) OTLPMetricsEndpoint() (string, bool) {
+	return ResolveOTLPEndpoint(m.MetricsEndpoint, m.CommonEndpoint, m.Grafana)
 }
 
 // EndpointEnabled specifies that the OTEL metrics node is enabled if and only if
@@ -248,6 +258,16 @@ func ReportMetrics(
 		if err != nil {
 			return nil, fmt.Errorf("instantiating OTEL metrics reporter: %w", err)
 		}
+
+		if mr.cfg.SpanMetricsEnabled() || mr.cfg.ServiceGraphMetricsEnabled() {
+			hostMetrics := mr.newMetricsInstance(nil)
+			hostMeter := hostMetrics.provider.Meter(reporterName)
+			err := mr.setupHostInfoMeter(hostMeter)
+			if err != nil {
+				return nil, fmt.Errorf("setting up host metrics: %w", err)
+			}
+		}
+
 		return mr.reportMetrics, nil
 	}
 }
@@ -536,6 +556,17 @@ func (mr *MetricsReporter) setupSpanMeters(m *Metrics, meter instrument.Meter) e
 	return nil
 }
 
+func (mr *MetricsReporter) setupHostInfoMeter(meter instrument.Meter) error {
+	tracesHostInfo, err := meter.Int64Gauge(TracesHostInfo)
+	if err != nil {
+		return fmt.Errorf("creating span metric traces host info: %w", err)
+	}
+	attrOpt := instrument.WithAttributeSet(mr.metricHostAttributes())
+	tracesHostInfo.Record(mr.ctx, 1, attrOpt)
+
+	return nil
+}
+
 func (mr *MetricsReporter) setupGraphMeters(m *Metrics, meter instrument.Meter) error {
 	if !mr.cfg.ServiceGraphMetricsEnabled() {
 		return nil
@@ -583,10 +614,14 @@ func (mr *MetricsReporter) setupGraphMeters(m *Metrics, meter instrument.Meter) 
 	return nil
 }
 
-func (mr *MetricsReporter) newMetricSet(service *svc.Attrs) (*Metrics, error) {
-	mlog := mlog().With("service", service)
+func (mr *MetricsReporter) newMetricsInstance(service *svc.Attrs) Metrics {
+	mlog := mlog()
+	var resourceAttributes []attribute.KeyValue
+	if service != nil {
+		mlog = mlog.With("service", service)
+		resourceAttributes = append(getAppResourceAttrs(mr.hostID, service), ResourceAttrsFromEnv(service)...)
+	}
 	mlog.Debug("creating new Metrics reporter")
-	resourceAttributes := append(getAppResourceAttrs(mr.hostID, service), ResourceAttrsFromEnv(service)...)
 	resources := resource.NewWithAttributes(semconv.SchemaURL, resourceAttributes...)
 
 	opts := []metric.Option{
@@ -599,13 +634,18 @@ func (mr *MetricsReporter) newMetricSet(service *svc.Attrs) (*Metrics, error) {
 	opts = append(opts, mr.spanMetricOptions(mlog)...)
 	opts = append(opts, mr.graphMetricOptions(mlog)...)
 
-	m := Metrics{
+	return Metrics{
 		ctx:     mr.ctx,
 		service: service,
 		provider: metric.NewMeterProvider(
 			opts...,
 		),
 	}
+}
+
+func (mr *MetricsReporter) newMetricSet(service *svc.Attrs) (*Metrics, error) {
+	m := mr.newMetricsInstance(service)
+
 	// time units for HTTP and GRPC durations are in seconds, according to the OTEL specification:
 	// https://github.com/open-telemetry/opentelemetry-specification/tree/main/specification/metrics/semantic_conventions
 	// TODO: set ExplicitBucketBoundaries here and in prometheus from the previous specification
@@ -759,6 +799,14 @@ func (mr *MetricsReporter) metricResourceAttributes(service *svc.Attrs) attribut
 	}
 	for k, v := range service.Metadata {
 		attrs = append(attrs, k.OTEL().String(v))
+	}
+
+	return attribute.NewSet(attrs...)
+}
+
+func (mr *MetricsReporter) metricHostAttributes() attribute.Set {
+	attrs := []attribute.KeyValue{
+		GrafanaHostIDKey.String(mr.hostID),
 	}
 
 	return attribute.NewSet(attrs...)
@@ -920,7 +968,7 @@ func (mr *MetricsReporter) reportMetrics(input <-chan []request.Span) {
 }
 
 func getHTTPMetricEndpointOptions(cfg *MetricsConfig) (otlpOptions, error) {
-	opts := otlpOptions{}
+	opts := otlpOptions{Headers: map[string]string{}}
 	log := mlog().With("transport", "http")
 	murl, isCommon, err := parseMetricsEndpoint(cfg)
 	if err != nil {
@@ -953,12 +1001,14 @@ func getHTTPMetricEndpointOptions(cfg *MetricsConfig) (otlpOptions, error) {
 	}
 
 	cfg.Grafana.setupOptions(&opts)
+	maps.Copy(opts.Headers, HeadersFromEnv(envHeaders))
+	maps.Copy(opts.Headers, HeadersFromEnv(envMetricsHeaders))
 
 	return opts, nil
 }
 
 func getGRPCMetricEndpointOptions(cfg *MetricsConfig) (otlpOptions, error) {
-	opts := otlpOptions{}
+	opts := otlpOptions{Headers: map[string]string{}}
 	log := mlog().With("transport", "grpc")
 	murl, _, err := parseMetricsEndpoint(cfg)
 	if err != nil {
@@ -977,6 +1027,11 @@ func getGRPCMetricEndpointOptions(cfg *MetricsConfig) (otlpOptions, error) {
 		log.Debug("Setting InsecureSkipVerify")
 		opts.SkipTLSVerify = true
 	}
+
+	cfg.Grafana.setupOptions(&opts)
+	maps.Copy(opts.Headers, HeadersFromEnv(envHeaders))
+	maps.Copy(opts.Headers, HeadersFromEnv(envMetricsHeaders))
+
 	return opts, nil
 }
 
@@ -987,15 +1042,7 @@ func getGRPCMetricEndpointOptions(cfg *MetricsConfig) (otlpOptions, error) {
 // If, by some reason, Grafana changes its OTLP Gateway URL in a distant future, you can still point to the
 // correct URL with the OTLP_EXPORTER_... variables.
 func parseMetricsEndpoint(cfg *MetricsConfig) (*url.URL, bool, error) {
-	isCommon := false
-	endpoint := cfg.MetricsEndpoint
-	if endpoint == "" {
-		isCommon = true
-		endpoint = cfg.CommonEndpoint
-		if endpoint == "" && cfg.Grafana != nil && cfg.Grafana.CloudZone != "" {
-			endpoint = cfg.Grafana.Endpoint()
-		}
-	}
+	endpoint, isCommon := cfg.OTLPMetricsEndpoint()
 
 	murl, err := url.Parse(endpoint)
 	if err != nil {
